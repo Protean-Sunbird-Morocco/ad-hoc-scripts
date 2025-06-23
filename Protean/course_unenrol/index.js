@@ -5,11 +5,11 @@ const axios = require('axios');
 const { Parser } = require('json2csv');
 const { log } = require('console');
 
+const GRANT_TYPE = 'password';
 const HOST = '<<host>>';
 const API_KEY = '<<api-key>>';
 const CLIENT_ID = 'direct-grant';
 const CLIENT_SECRET = '<<client-secret>>';
-const GRANT_TYPE = 'password';
 const CHANNEL_ID = '<<channel-id>>';
 const CREATOR_USERNAME = '<<creator-username>>';
 const CREATOR_PASSWORD = '<<creator-password>>';
@@ -32,7 +32,6 @@ async function getKeycloakToken(username, password) {
       'Authorization': `Bearer ${API_KEY}`,
     }
   });
-
   return res.data;
 }
 
@@ -71,7 +70,6 @@ async function getUserId(email, userAccessToken) {
 async function getCourseAndBatch(courseCode, creatorAccessToken, userToken) {
   const url = `${HOST}/api/composite/v1/search`;
   const payload = { request: { filters: { code: courseCode } } };
-
   const res = await axios.post(url, payload, {
     headers: {
       'Accept': 'application/json',
@@ -81,13 +79,22 @@ async function getCourseAndBatch(courseCode, creatorAccessToken, userToken) {
       'x-authenticated-user-token': userToken,
     }
   });
-
+  
   const courses = res.data.result.content;
+  
   if (!courses || courses.length === 0) throw new Error(`Course not found: ${courseCode}`);
-  const course = courses[0];
-  const batchId = course.batches?.[0]?.batchId;
-  if (!batchId) throw new Error(`No batch found for course ${courseCode}`);
-  return { courseId: course.identifier, batchId };
+  
+  const courseIdWithBatches = [];
+  for(const c of courses)
+  {
+      const courseId = c.identifier;
+      for(const b of c.batches)
+      {
+        const batchId = b.batchId;
+        courseIdWithBatches.push({courseId, batchId});
+      }
+  }
+  return courseIdWithBatches;
 }
 
 async function getContentIds(courseId, creatorAccessToken) {
@@ -132,7 +139,8 @@ function getFormattedTimestamp() {
   return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}:${milliseconds}${timezone}`;
 }
 
-async function unenrolCourse(userId, batchId, courseId, userAccessToken) {
+async function unenrolCourse(userId, batchId, courseId, userAccessToken) 
+{
   const url = `${HOST}/api/course/v1/unenrol`;
   const payload = {
     request: {
@@ -142,13 +150,44 @@ async function unenrolCourse(userId, batchId, courseId, userAccessToken) {
     }
   };
 
-  await axios.post(url, payload, {
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${API_KEY}`,
-      'x-authenticated-user-token': userAccessToken,
+  const status = 'failure';
+  const msg = '';
+  try {
+    const res = await axios.post(url, payload, {
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${API_KEY}`,
+        'x-authenticated-user-token': userAccessToken,
+      }
+    });
+    console.log("success res : " + JSON.stringify(res.data));
+    if(res.data?.params?.status === 'success')
+    {
+      return {status:'success', msg};
     }
-  });
+    else
+    {
+      return {status, msg:res.data?.params?.errmsg};
+    }
+ } 
+ catch(error) 
+ {
+    if (error.response) {
+    const errData = error.response.data;
+    if (errData?.params?.err === 'USER_NOT_ENROLLED_COURSE') {
+      console.warn('User is not enrolled in the given course batch.');
+      return {status, msg:'User is not enrolled in the given course batch.'};
+    } else {
+      console.error('API Error:', errData?.params?.errmsg || 'Unknown error');
+      return {status, msg: errData?.params?.errmsg || 'Unknown error'};
+    }
+
+  } else {
+    console.error('Unexpected Error:', error.message);
+    return {status, msg:error.message};
+  }
+ }
+
 }
 
 // Main execution
@@ -169,51 +208,70 @@ async function unenrolCourse(userId, batchId, courseId, userAccessToken) {
         for (const row of allRows) {
           const email = row.email.trim();
           const password = '';
+          const codes = row.course_code.split(',').map(c => c.trim().replace(/"/g, ''));
 
           //comming from CSV
-          const userId = row.userId.trim();
-          const batchId = row.batchId.trim();
-          const courseId = row.courseId.trim();
-
+          let userId = null;
+          let batchId = null;
+          let courseId = null;
+          
           console.log(`Processing: ${email}`);
 
-          try {
-            const userTokenResp = await getKeycloakToken(email, password);
-            const userAccess = await refreshAccessToken(userTokenResp.refresh_token);
+          for (const code of codes) {
+            try 
+            {
+              const userTokenResp = await getKeycloakToken(email, password);
+              const userAccess = await refreshAccessToken(userTokenResp.refresh_token);
+              console.log("userAccess token : " + JSON.stringify(userAccess));
+              try 
+              {
+                userId = await getUserId(email, userAccess.access_token);
+                
+                const courseIdWithBatches = await getCourseAndBatch(code, creatorAccess.access_token, userAccess.access_token);
+                
+                //courseId = courseIdAndBatchId.courseId;
+                //batchId = courseIdAndBatchId.batchId;
+                
+                for(const cb of courseIdWithBatches) 
+                {
+                  const batchId = cb.batchId;
+                  const courseId = cb.courseId;
+                  const {status, msg} = await unenrolCourse(userId, batchId, courseId, userAccess.access_token);
 
-            try {
+                  outputRows.push({
+                    email,
+                    userId,
+                    batchId,
+                    courseId,
+                    status: status,
+                    remark: msg
+                  });
 
-              await unenrolCourse(userId, batchId, courseId, userAccess.access_token);
-
-              outputRows.push({
-                email,
-                userId,
-                batchId,
-                courseId,
-                status: 'success',
-                remark: ''
-              });
+                }
+                
+              } catch (err) {
+                const errMsg = err?.response?.data?.params?.errmsg || err.message;
+                console.log(errMsg);
+                outputRows.push({
+                  email,
+                  userId,
+                  batchId,
+                  courseId,
+                  status: 'failure',
+                  remark: errMsg
+                });
+              }
             } catch (err) {
-              const errMsg = err?.response?.data?.params?.errmsg || err.message;
-
               outputRows.push({
                 email,
                 userId,
                 batchId,
                 courseId,
                 status: 'failure',
-                remark: errMsg
+                remark: err.message
               });
             }
-          } catch (err) {
-            outputRows.push({
-              email,
-              userId,
-              batchId,
-              courseId,
-              status: 'failure',
-              remark: err.message
-            });
+
           }
         }
 
